@@ -1,5 +1,4 @@
 # WEBGL_Roll_On
-WebGL game playable on Github Pages.
 
 🔥 Get ready to ROLL ON with the most thrilling and addictive hyper-casual mobile game ever! 🔥
 
