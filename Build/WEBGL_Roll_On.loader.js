@@ -40,10 +40,20 @@ function createUnityInstance(canvas, config, onProgress) {
     errorHandler(message, filename, lineno);
   }
 
+  function fallbackToDefaultConfigWithWarning(config, key, defaultValue) {
+    var value = config[key];
+
+    if (typeof value === "undefined" || !value) {
+      console.warn("Config option \"" + key + "\" is missing or empty. Falling back to default value: \"" + defaultValue + "\". Consider updating your WebGL template to include the missing config option.");
+      config[key] = defaultValue;
+    }
+  }
+
   var Module = {
     canvas: canvas,
     webglContextAttributes: {
       preserveDrawingBuffer: false,
+      powerPreference: 2,
     },
     cacheControl: function (url) {
       return url == Module.dataUrl ? "must-revalidate" : "no-store";
@@ -89,6 +99,11 @@ function createUnityInstance(canvas, config, onProgress) {
     ],
   };
 
+  // Add fallback values for companyName, productName and productVersion to ensure that the UnityCache is working. 
+  fallbackToDefaultConfigWithWarning(config, "companyName", "Unity");
+  fallbackToDefaultConfigWithWarning(config, "productName", "WebGL Player");
+  fallbackToDefaultConfigWithWarning(config, "productVersion", "1.0");
+  
   for (var parameter in config)
     Module[parameter] = config[parameter];
 
@@ -369,7 +384,7 @@ function createUnityInstance(canvas, config, onProgress) {
     onProgress(0.9 * totalProgress);
   }
 
-Module.fetchWithProgress = function () {
+Module.readBodyWithProgress = function() {
   /**
    * Estimate length of uncompressed content by taking average compression ratios
    * of compression type into account.
@@ -396,7 +411,108 @@ Module.fetchWithProgress = function () {
     }
   }
 
+  function readBodyWithProgress(response, onProgress, enableStreaming) {
+    var reader = response.body ? response.body.getReader() : undefined;
+    var lengthComputable = typeof response.headers.get('Content-Length') !== "undefined";
+    var estimatedContentLength = estimateContentLength(response, lengthComputable);
+    var body = new Uint8Array(estimatedContentLength);
+    var trailingChunks = [];
+    var receivedLength = 0;
+    var trailingChunksStart = 0;
 
+    if (!lengthComputable) {
+      console.warn("[UnityCache] Response is served without Content-Length header. Please reconfigure server to include valid Content-Length for better download performance.");
+    }
+
+    function readBody() {
+      if (typeof reader === "undefined") {
+        // Browser does not support streaming reader API
+        // Fallback to Respone.arrayBuffer()
+        return response.arrayBuffer().then(function (buffer) {
+          var body = new Uint8Array(buffer);
+          onProgress({
+            type: "progress",
+            response: response,
+            total: buffer.length,
+            loaded: 0,
+            lengthComputable: lengthComputable,
+            chunk: enableStreaming ? body : null
+          });
+          
+          return body;
+        });
+      }
+      
+      // Start reading memory chunks
+      return reader.read().then(function (result) {
+        if (result.done) {
+          return concatenateTrailingChunks();
+        }
+
+        if ((receivedLength + result.value.length) <= body.length) {
+          // Directly append chunk to body if enough memory was allocated
+          body.set(result.value, receivedLength);
+          trailingChunksStart = receivedLength + result.value.length;
+        } else {
+          // Store additional chunks in array to append later
+          trailingChunks.push(result.value);
+        }
+
+        receivedLength += result.value.length;
+        onProgress({
+          type: "progress",
+          response: response,
+          total: Math.max(estimatedContentLength, receivedLength),
+          loaded: receivedLength,
+          lengthComputable: lengthComputable,
+          chunk: enableStreaming ? result.value : null
+        });
+
+        return readBody();
+      });
+    }
+
+    function concatenateTrailingChunks() {
+      if (receivedLength === estimatedContentLength) {
+        return body;
+      }
+
+      if (receivedLength < estimatedContentLength) {
+        // Less data received than estimated, shrink body
+        return body.slice(0, receivedLength);
+      }
+
+      // More data received than estimated, create new larger body to prepend all additional chunks to the body
+      var newBody = new Uint8Array(receivedLength);
+      newBody.set(body, 0);
+      var position = trailingChunksStart;
+      for (var i = 0; i < trailingChunks.length; ++i) {
+        newBody.set(trailingChunks[i], position);
+        position += trailingChunks[i].length;
+      }
+
+      return newBody;
+    }
+
+    return readBody().then(function (parsedBody) {
+      onProgress({
+        type: "load",
+        response: response,
+        total: parsedBody.length,
+        loaded: parsedBody.length,
+        lengthComputable: lengthComputable,
+        chunk: null
+      });
+
+      response.parsedBody = parsedBody;
+      return response;
+    });
+  }
+
+  return readBodyWithProgress;
+}();
+
+Module.fetchWithProgress = function () {
   function fetchWithProgress(resource, init) {
     var onProgress = function () { };
     if (init && init.onProgress) {
@@ -404,94 +520,7 @@ Module.fetchWithProgress = function () {
     }
 
     return fetch(resource, init).then(function (response) {
-      var reader = (typeof response.body !== "undefined") ? response.body.getReader() : undefined;
-      var lengthComputable = typeof response.headers.get('Content-Length') !== "undefined";
-      var estimatedContentLength = estimateContentLength(response, lengthComputable);
-      var body = new Uint8Array(estimatedContentLength);
-      var trailingChunks = [];
-      var receivedLength = 0;
-      var trailingChunksStart = 0;
-
-      if (!lengthComputable) {
-        console.warn("[UnityCache] Response is served without Content-Length header. Please reconfigure server to include valid Content-Length for better download performance.");
-      }
-
-      function readBodyWithProgress() {
-        if (typeof reader === "undefined") {
-          // Browser does not support streaming reader API
-          // Fallback to Respone.arrayBuffer()
-          return response.arrayBuffer().then(function (buffer) {
-            onProgress({
-              type: "progress",
-              total: buffer.length,
-              loaded: 0,
-              lengthComputable: lengthComputable
-            });
-            
-            return new Uint8Array(buffer);
-          });
-        }
-        
-        // Start reading memory chunks
-        return reader.read().then(function (result) {
-          if (result.done) {
-            return concatenateTrailingChunks();
-          }
-
-          if ((receivedLength + result.value.length) <= body.length) {
-            // Directly append chunk to body if enough memory was allocated
-            body.set(result.value, receivedLength);
-            trailingChunksStart = receivedLength + result.value.length;
-          } else {
-            // Store additional chunks in array to append later
-            trailingChunks.push(result.value);
-          }
-
-          receivedLength += result.value.length;
-          onProgress({
-            type: "progress",
-            total: Math.max(estimatedContentLength, receivedLength),
-            loaded: receivedLength,
-            lengthComputable: lengthComputable
-          });
-
-          return readBodyWithProgress();
-        });
-      }
-
-      function concatenateTrailingChunks() {
-        if (receivedLength === estimatedContentLength) {
-          return body;
-        }
-
-        if (receivedLength < estimatedContentLength) {
-          // Less data received than estimated, shrink body
-          return body.slice(0, receivedLength);
-        }
-
-        // More data received than estimated, create new larger body to prepend all additional chunks to the body
-        var newBody = new Uint8Array(receivedLength);
-        newBody.set(body, 0);
-        var position = trailingChunksStart;
-        for (var i = 0; i < trailingChunks.length; ++i) {
-          newBody.set(trailingChunks[i], position);
-          position += trailingChunks[i].length;
-        }
-
-        return newBody;
-      }
-
-      return readBodyWithProgress().then(function (parsedBody) {
-        onProgress({
-          type: "load",
-          total: parsedBody.length,
-          loaded: parsedBody.length,
-          lengthComputable: lengthComputable
-        });
-
-        response.parsedBody = parsedBody;
-        return response;
-      });
+      return Module.readBodyWithProgress(response, onProgress, init.enableStreamingDownload);
     });
   }
 
